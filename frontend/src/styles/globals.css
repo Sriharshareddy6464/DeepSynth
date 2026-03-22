@@ -1,0 +1,20 @@
+:root {
+  --bg-primary:   #0a0f1e;
+  --bg-secondary: #0d1b2a;
+  --bg-card:      #111827;
+  --accent:       #64ffda;
+  --accent-dark:  #0d9488;
+  --text-primary: #ffffff;
+  --text-muted:   #6b7280;
+  --border:       #1e293b;
+  --real:         #64ffda;
+  --fake:         #ef4444;
+  --radius:       12px;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: 'Inter', sans-serif;
+}

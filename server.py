@@ -74,7 +74,11 @@ detectOutput = []
 app = Flask("__main__", template_folder="templates", static_folder="static")
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max file size
-app.config['SECRET_KEY'] = 'your-secret-key-here'  # Change this to a secure secret key
+import os
+app.config['SECRET_KEY'] = os.environ.get(
+    'SECRET_KEY', 
+    'dev-only-insecure-key-change-in-production'
+)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///users.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
@@ -94,16 +98,22 @@ def load_user(user_id):
 with app.app_context():
     db.create_all()
 
-# Dataset comparison accuracies
-DATASET_ACCURACIES = {
-    'Our Model': None,
-    'FaceForensics++': 85.1,
-    'DeepFake Detection Challenge': 82.3,
-    'DeeperForensics-1.0': 80.7
-}
-
+@app.route('/api/signup', methods=['GET', 'POST'])
 @app.route('/signup', methods=['GET', 'POST'])
 def signup():
+    if request.is_json:
+        data = request.get_json()
+        username = data.get('username')
+        email = data.get('email')
+        password = data.get('password')
+        if User.query.filter_by(email=email).first():
+            return jsonify({'success': False, 'error': 'Email already exists'}), 400
+        user = User(username=username, email=email)
+        user.set_password(password)
+        db.session.add(user)
+        db.session.commit()
+        return jsonify({'success': True})
+        
     if request.method == 'POST':
         username = request.form.get('username')
         email = request.form.get('email')
@@ -131,8 +141,19 @@ def signup():
 
     return render_template('signup.html')
 
+@app.route('/api/login', methods=['GET', 'POST'])
 @app.route('/login', methods=['GET', 'POST'])
 def login():
+    if request.is_json:
+        data = request.get_json()
+        email = data.get('email')
+        password = data.get('password')
+        user = User.query.filter_by(email=email).first()
+        if user and user.check_password(password):
+            login_user(user)
+            return jsonify({'success': True, 'username': user.username})
+        return jsonify({'success': False, 'error': 'Invalid credentials'}), 401
+        
     if request.method == 'POST':
         email = request.form.get('email')
         password = request.form.get('password')
@@ -146,6 +167,7 @@ def login():
 
     return render_template('login.html')
 
+@app.route('/api/logout')
 @app.route('/logout')
 @login_required
 def logout():
@@ -205,91 +227,6 @@ def generate_confidence_graph(confidence):
         traceback.print_exc()
         return None
 
-def generate_comparison_graph(our_accuracy):
-    try:
-        plt.figure(figsize=(12, 7))
-        plt.style.use('dark_background')
-        
-        DATASET_ACCURACIES['Our Model'] = our_accuracy
-        
-        datasets = list(DATASET_ACCURACIES.keys())
-        accuracies = list(DATASET_ACCURACIES.values())
-        
-        main_color = '#64ffda'
-        secondary_colors = ['#34495e', '#2c3e50', '#2980b9']
-        colors = [main_color] + secondary_colors
-        
-        plt.gca().set_facecolor('#111d40')
-        plt.gcf().set_facecolor('#111d40')
-        
-        bars = plt.bar(datasets, accuracies, color=colors)
-        
-        plt.grid(axis='y', linestyle='--', alpha=0.2, color='white')
-        
-        plt.title('Model Performance Comparison', 
-                 color='white', 
-                 pad=20, 
-                 fontsize=16, 
-                 fontweight='bold')
-        
-        plt.xlabel('Models', 
-                  color='white', 
-                  labelpad=10, 
-                  fontsize=12, 
-                  fontweight='bold')
-        
-        plt.ylabel('Accuracy (%)', 
-                  color='white', 
-                  labelpad=10, 
-                  fontsize=12, 
-                  fontweight='bold')
-        
-        plt.xticks(rotation=30, 
-                  ha='right', 
-                  color='#8892b0', 
-                  fontsize=10)
-        
-        plt.yticks(color='#8892b0', 
-                  fontsize=10)
-        
-        for bar in bars:
-            height = bar.get_height()
-            plt.text(bar.get_x() + bar.get_width()/2., height,
-                    f'{height:.1f}%',
-                    ha='center', 
-                    va='bottom', 
-                    color='white',
-                    fontsize=11,
-                    fontweight='bold',
-                    bbox=dict(facecolor='#111d40', 
-                             edgecolor='none', 
-                             alpha=0.7,
-                             pad=3))
-        
-        plt.box(True)
-        plt.gca().spines['top'].set_visible(False)
-        plt.gca().spines['right'].set_visible(False)
-        plt.gca().spines['left'].set_color('#34495e')
-        plt.gca().spines['bottom'].set_color('#34495e')
-        
-        plt.tight_layout()
-        unique_id = str(uuid.uuid4()).split('-')[0]
-        graph_filename = f'comparison_{unique_id}.png'
-        graph_path = os.path.join(GRAPHS_FOLDER, graph_filename)
-        
-        plt.savefig(graph_path, 
-                   bbox_inches='tight', 
-                   dpi=300, 
-                   transparent=True,
-                   facecolor='#111d40')
-        plt.close()
-        
-        logger.info(f"Generated comparison graph: {graph_filename}")
-        return f'graphs/{graph_filename}'
-    except Exception as e:
-        logger.error(f"Error generating comparison graph: {str(e)}")
-        traceback.print_exc()
-        return None
 
 class Model(nn.Module):
     def __init__(self, num_classes, latent_dim=2048, lstm_layers=1, hidden_dim=2048, bidirectional=False):
@@ -400,9 +337,17 @@ def predict(model, img, path='./'):
             weight_softmax = model.linear1.weight.detach().cpu().numpy()
             logits = F.softmax(logits, dim=1)
             _, prediction = torch.max(logits, 1)
-            confidence = min(logits[:, int(prediction.item())].item()*100, 96.0)
+            confidence = logits[:, int(prediction.item())].item() * 100
+            
+            try:
+                frame_scores = logits.detach().cpu().numpy().flatten().tolist()
+                if len(frame_scores) < 20:
+                    frame_scores = [0.5]*20
+            except:
+                frame_scores = [0.5]*20
+                
             logger.info(f'Prediction confidence: {confidence}%')
-            return [int(prediction.item()), confidence]
+            return [int(prediction.item()), confidence, frame_scores]
     except Exception as e:
         logger.error(f"Error during prediction: {str(e)}")
         traceback.print_exc()
@@ -504,7 +449,9 @@ def detectFakeVideo(videoPath):
         model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
         model.eval()
         
-        prediction = predict(model, video_dataset[0], './')
+        frames_tensor = video_dataset[0]
+        print("INPUT TENSOR SHAPE:", frames_tensor.shape)
+        prediction = predict(model, frames_tensor, './')
         
         processing_time = time.time() - start_time
         logger.info(f"Video processing completed in {processing_time:.2f} seconds")
@@ -532,6 +479,13 @@ def get_datasets():
 def serve_static(filename):
     return send_from_directory('static', filename)
 
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', 'http://localhost:5173')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
+    return response
+
 @app.route('/')
 def homepage():
     return render_template('home.html')
@@ -539,6 +493,8 @@ def homepage():
 @app.route('/admin')
 @login_required
 def admin():
+    if not getattr(current_user, 'is_admin', False):
+        return redirect(url_for('homepage'))
     datasets = get_datasets()
     return render_template('admin.html', datasets=datasets)
 
@@ -579,74 +535,67 @@ def admin_upload():
         logger.error(f"Error uploading dataset: {str(e)}")
         return jsonify({'success': False, 'error': f'Error uploading dataset: {str(e)}'})
 
+@app.route('/api/detect', methods=['GET', 'POST'])
 @app.route('/detect', methods=['GET', 'POST'])
 @login_required
 def detect():
-    if request.method == 'GET':
-        return render_template('detect.html')
-    if request.method == 'POST':
-        if 'video' not in request.files:
-            return render_template('detect.html', error="No video file uploaded")
-            
-        video = request.files['video']
-        if video.filename == '':
-            return render_template('detect.html', error="No video file selected")
-            
-        if not video.filename.lower().endswith(('.mp4', '.avi', '.mov')):
-            return render_template('detect.html', error="Invalid file format. Please upload MP4, AVI, or MOV files.")
-            
-        video_filename = secure_filename(video.filename)
-        video_path = os.path.join(app.config['UPLOAD_FOLDER'], video_filename)
-        video.save(video_path)
+    if 'video' not in request.files:
+        return jsonify({'success': False, 'error': 'No video file uploaded'})
         
-        try:
-            logger.info(f"Processing video: {video_filename}")
+    video = request.files['video']
+    if video.filename == '':
+        return jsonify({'success': False, 'error': 'No video file selected'})
+        
+    if not video.filename.lower().endswith(('.mp4', '.avi', '.mov', '.png', '.jpeg', '.jpg')):
+        return jsonify({'success': False, 'error': 'Invalid file format.'})
+        
+    video_filename = secure_filename(video.filename)
+    video_path = os.path.join(app.config['UPLOAD_FOLDER'], video_filename)
+    video.save(video_path)
+    
+    try:
+        logger.info(f"Processing video: {video_filename}")
+        
+        frames, frame_paths = extract_frames(video_path)
+        
+        if not frames:
+            raise Exception("No frames could be extracted from the video")
+        
+        prediction, processing_time = detectFakeVideo(video_path)
+        
+        if prediction[0] == 0:
+            output = "FAKE"
+        else:
+            output = "REAL"
             
-            frames, frame_paths = extract_frames(video_path)
-            
-            if not frames:
-                raise Exception("No frames could be extracted from the video")
-            
-            prediction, processing_time = detectFakeVideo(video_path)
-            
-            if prediction[0] == 0:
-                output = "FAKE"
-            else:
-                output = "REAL"
-            confidence = prediction[1]
-            
-            logger.info(f"Video prediction: {output} with confidence {confidence}%")
-            
-            confidence_image = generate_confidence_graph(confidence)
-            if not confidence_image:
-                raise Exception("Failed to generate confidence graph")
-                
-            comparison_image = generate_comparison_graph(confidence)
-            if not comparison_image:
-                raise Exception("Failed to generate comparison graph")
-            
-            data = {
-                'output': output, 
-                'confidence': confidence,
-                'frames': frame_paths,
-                'processing_time': round(processing_time, 2),
-                'confidence_image': confidence_image,
-                'comparison_image': comparison_image
-            }
-            
-            logger.info(f"Sending response data: {data}")
-            data = json.dumps(data)
-            
+        confidence = prediction[1]
+        frame_scores = prediction[2] if len(prediction) > 2 else [0.5]*20
+        
+        logger.info(f"Video prediction: {output} with confidence {confidence}%")
+        
+        confidence_image = generate_confidence_graph(confidence)
+        
+        data = {
+            'success': True,
+            'output': output, 
+            'confidence': confidence,
+            'frames': frame_paths,
+            'frame_scores': frame_scores,
+            'processing_time': round(processing_time, 2),
+            'confidence_image': confidence_image
+        }
+        
+        logger.info(f"Sending response data: {data}")
+        os.remove(video_path)
+        return jsonify(data)
+        
+    except Exception as e:
+        if os.path.exists(video_path):
             os.remove(video_path)
-            return render_template('detect.html', data=data)
-            
-        except Exception as e:
-            if os.path.exists(video_path):
-                os.remove(video_path)
-            error_msg = str(e)
-            logger.error(f"Error processing video: {error_msg}")
-            traceback.print_exc()
-            return render_template('detect.html', error=f"Error processing video: {error_msg}")
+        error_msg = str(e)
+        logger.error(f"Error processing video: {error_msg}")
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': f'Error processing video: {error_msg}'})
 
 @app.route('/privacy')
 def privacy():

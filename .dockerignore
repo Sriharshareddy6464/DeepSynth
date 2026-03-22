@@ -1,23 +1,47 @@
-# Ignore Python cache and virtual environments
+# Git
+.git
+.gitignore
+
+# Python
+venv/
 __pycache__/
 *.pyc
 *.pyo
-*.pyd
-venv/
-.env
 
-# Ignore logs and temp files
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Database (fresh db created at container start)
+*.db
+*.sqlite
+users.db
+
+# Environment secrets
+.env
+*.env
+
+# User uploaded files
+static/uploads/
+static/frames/
+
+# Dev/notebook files
+*.ipynb
+Admin/
+gen_.ipynb
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
 *.log
 logs/
-tmp/
-*.swp
 
-# Ignore Git files
-.git/
-.gitignore
-
-# Ignore Docker build files
-.dockerignore
-
-# Ignore node_modules (if applicable)
-node_modules/
+# Model weights (pulled from HuggingFace at runtime)
+*.pt
+*.pth
