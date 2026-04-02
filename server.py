@@ -14,13 +14,10 @@ from backend.config.settings import (
     UPLOAD_FOLDER,
     ensure_runtime_directories,
 )
+from backend.services.ml_service import detect_fake_video
+from backend.services.video_service import extract_frames
 from backend.utils.file_utils import is_allowed_video
 from backend.utils.response import json_error, json_success
-import cv2
-import mediapipe as mp
-import numpy as np
-import torch
-import torch.nn.functional as F
 from flask import Flask, request, send_from_directory
 from flask_login import (
     LoginManager,
@@ -29,25 +26,11 @@ from flask_login import (
     login_user,
     logout_user,
 )
-from huggingface_hub import hf_hub_download
 from backend.models.db_models import User, db
-from torch import nn
-from torch.utils.data.dataset import Dataset
-from torchvision import models, transforms
 from werkzeug.exceptions import HTTPException
 from werkzeug.utils import secure_filename
 
 warnings.filterwarnings("ignore")
-
-# Initialize MediaPipe Face Mesh for CPU
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(
-    static_image_mode=True,
-    max_num_faces=1,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5,
-    refine_landmarks=False,
-)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -300,221 +283,6 @@ def admin_upload():
 @login_required
 def serve_frame(filename):
     return send_from_directory(FRAMES_FOLDER, filename)
-
-
-class Model(nn.Module):
-    def __init__(
-        self,
-        num_classes,
-        latent_dim=2048,
-        lstm_layers=1,
-        hidden_dim=2048,
-        bidirectional=False,
-    ):
-        super().__init__()
-        backbone = models.resnext50_32x4d(pretrained=True)
-        self.model = nn.Sequential(*list(backbone.children())[:-2])
-        self.lstm = nn.LSTM(latent_dim, hidden_dim, lstm_layers, bidirectional)
-        self.dp = nn.Dropout(0.4)
-        self.linear1 = nn.Linear(2048, num_classes)
-        self.avgpool = nn.AdaptiveAvgPool2d(1)
-
-    def forward(self, x):
-        batch_size, seq_length, channels, height, width = x.shape
-        x = x.view(batch_size * seq_length, channels, height, width)
-        fmap = self.model(x)
-        x = self.avgpool(fmap)
-        x = x.view(batch_size, seq_length, 2048)
-        x_lstm, _ = self.lstm(x, None)
-        return fmap, self.dp(self.linear1(x_lstm[:, -1, :]))
-
-
-def extract_frames(video_path, num_frames=8):
-    frames = []
-    frame_paths = []
-    unique_id = str(uuid.uuid4()).split("-")[0]
-
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise ValueError("Error opening video file")
-
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total_frames <= 0:
-        raise ValueError("Video file appears to be empty")
-
-    interval = max(total_frames // max(num_frames, 1), 1)
-
-    count = 0
-    frame_count = 0
-
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        if count % interval == 0 and frame_count < num_frames:
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = face_mesh.process(rgb_frame)
-
-            if not results.multi_face_landmarks:
-                count += 1
-                continue
-
-            try:
-                face_landmarks = results.multi_face_landmarks[0]
-
-                height, width, _ = frame.shape
-                x_coordinates = [landmark.x for landmark in face_landmarks.landmark]
-                y_coordinates = [landmark.y for landmark in face_landmarks.landmark]
-
-                x_min, x_max = min(x_coordinates), max(x_coordinates)
-                y_min, y_max = min(y_coordinates), max(y_coordinates)
-
-                x = int(x_min * width)
-                y = int(y_min * height)
-                face_width = int((x_max - x_min) * width)
-                face_height = int((y_max - y_min) * height)
-
-                padding_x = int(face_width * 0.2)
-                padding_y = int(face_height * 0.2)
-
-                left = max(0, x - padding_x)
-                top = max(0, y - padding_y)
-                right = min(width, x + face_width + padding_x)
-                bottom = min(height, y + face_height + padding_y)
-
-                face_frame = frame[top:bottom, left:right, :]
-                frame_filename = f"frame_{unique_id}_{frame_count}.jpg"
-                frame_path = os.path.join(FRAMES_FOLDER, frame_filename)
-                cv2.imwrite(frame_path, face_frame)
-                frame_paths.append(frame_filename)
-                frames.append(face_frame)
-                frame_count += 1
-                logger.info("Extracted frame %s: %s", frame_count, frame_filename)
-            except Exception as error:
-                logger.error("Error processing frame %s: %s", frame_count, error)
-
-        count += 1
-        if frame_count >= num_frames:
-            break
-
-    cap.release()
-
-    if len(frames) == 0:
-        raise ValueError("No faces detected in the video")
-
-    return frames, frame_paths
-
-
-def predict(model, img):
-    with torch.no_grad():
-        _, logits = model(img)
-        probabilities = F.softmax(logits, dim=1)
-        _, prediction = torch.max(probabilities, 1)
-        confidence = probabilities[:, int(prediction.item())].item() * 100
-        logger.info("Prediction confidence: %.2f%%", confidence)
-        return int(prediction.item()), float(confidence)
-
-
-class validation_dataset(Dataset):
-    def __init__(self, video_names, sequence_length=60, transform=None):
-        self.video_names = video_names
-        self.transform = transform
-        self.count = sequence_length
-
-    def __len__(self):
-        return len(self.video_names)
-
-    def __getitem__(self, idx):
-        video_path = self.video_names[idx]
-        frames = []
-        step = max(int(100 / self.count), 1)
-        first_frame = np.random.randint(0, step)
-
-        for i, frame in enumerate(self.frame_extract(video_path)):
-            if i < first_frame:
-                continue
-
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = face_mesh.process(rgb_frame)
-
-            try:
-                if results.multi_face_landmarks:
-                    face_landmarks = results.multi_face_landmarks[0]
-
-                    height, width, _ = frame.shape
-                    x_coordinates = [landmark.x for landmark in face_landmarks.landmark]
-                    y_coordinates = [landmark.y for landmark in face_landmarks.landmark]
-
-                    x_min, x_max = min(x_coordinates), max(x_coordinates)
-                    y_min, y_max = min(y_coordinates), max(y_coordinates)
-
-                    x = int(x_min * width)
-                    y = int(y_min * height)
-                    face_width = int((x_max - x_min) * width)
-                    face_height = int((y_max - y_min) * height)
-
-                    padding_x = int(face_width * 0.2)
-                    padding_y = int(face_height * 0.2)
-
-                    left = max(0, x - padding_x)
-                    top = max(0, y - padding_y)
-                    right = min(width, x + face_width + padding_x)
-                    bottom = min(height, y + face_height + padding_y)
-
-                    frame = frame[top:bottom, left:right, :]
-            except Exception:
-                pass
-
-            frames.append(self.transform(frame))
-            if len(frames) == self.count:
-                break
-
-        if not frames:
-            raise ValueError("Unable to extract valid frames for inference")
-
-        frames = torch.stack(frames)[: self.count]
-        return frames.unsqueeze(0)
-
-    def frame_extract(self, path):
-        video = cv2.VideoCapture(path)
-        success = True
-        while success:
-            success, image = video.read()
-            if success:
-                yield image
-
-
-def detect_fake_video(video_path):
-    start_time = time.time()
-
-    im_size = 112
-    mean = [0.485, 0.456, 0.406]
-    std = [0.229, 0.224, 0.225]
-
-    train_transforms = transforms.Compose(
-        [
-            transforms.ToPILImage(),
-            transforms.Resize((im_size, im_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean, std),
-        ]
-    )
-
-    video_dataset = validation_dataset([video_path], sequence_length=20, transform=train_transforms)
-    model = Model(2)
-
-    model_path = hf_hub_download(repo_id="imtiyaz123/DF_Model", filename="df_model.pt")
-    model.load_state_dict(torch.load(model_path, map_location=torch.device("cpu")))
-    model.eval()
-
-    frames_tensor = video_dataset[0]
-    prediction, confidence = predict(model, frames_tensor)
-
-    processing_time = time.time() - start_time
-    logger.info("Video processing completed in %.2f seconds", processing_time)
-
-    return prediction, confidence, processing_time
 
 
 @app.route("/api/detect", methods=["POST"])
