@@ -29,7 +29,7 @@ from flask_login import (
     logout_user,
 )
 from huggingface_hub import hf_hub_download
-from models import User, db
+from backend.models.db_models import User, db
 from torch import nn
 from torch.utils.data.dataset import Dataset
 from torchvision import models, transforms
