@@ -1,34 +1,23 @@
-export const login = async (email, password) => {
-  const res = await fetch('/api/login', {
+import { apiRequest } from './client';
+
+export const login = (email, password) =>
+  apiRequest('/api/login', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    credentials: 'include',
-    body: JSON.stringify({ email, password })
-  })
-  const data = await res.json()
-  if (data.success) {
-    localStorage.setItem('token', 'logged_in')
-    localStorage.setItem('username', data.username)
-  }
-  return data
-}
+    body: JSON.stringify({ email, password }),
+  });
 
-export const signup = async (username, email, password) => {
-  const res = await fetch('/api/signup', {
+export const register = (username, email, password) =>
+  apiRequest('/api/register', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    credentials: 'include',
-    body: JSON.stringify({ username, email, password })
-  })
-  return res.json()
-}
+    body: JSON.stringify({ username, email, password }),
+  });
 
-export const logout = () => {
-  localStorage.removeItem('token')
-  localStorage.removeItem('username')
-  fetch('/api/logout', { credentials: 'include' })
-}
+export const logout = () =>
+  apiRequest('/api/logout', {
+    method: 'POST',
+  });
 
-export const isLoggedIn = () => {
-  return !!localStorage.getItem('token')
-}
+export const getCurrentUser = () =>
+  apiRequest('/api/me', {
+    method: 'GET',
+  });

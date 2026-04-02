@@ -1,10 +1,14 @@
-export const analyzeVideo = async (file) => {
-  const formData = new FormData()
-  formData.append('video', file) // Must match 'video' input name in Flask server.py! User prompt said 'file', but I know server.py reads request.files['video']
-  
-  const res = await fetch('/api/detect', {
+import { apiRequest, buildApiUrl } from './client';
+
+export const analyzeVideo = (file) => {
+  const formData = new FormData();
+  formData.append('video', file);
+
+  return apiRequest('/api/detect', {
     method: 'POST',
-    body: formData
-  })
-  return res.json()
-}
+    body: formData,
+  });
+};
+
+export const getFrameAssetUrl = (frameFilename) =>
+  buildApiUrl(`/api/assets/frames/${encodeURIComponent(frameFilename)}`);

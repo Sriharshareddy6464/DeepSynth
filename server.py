@@ -1,357 +1,467 @@
-from flask import Flask, render_template, redirect, request, url_for, send_file, send_from_directory, flash
-from flask import jsonify, json
-from werkzeug.utils import secure_filename
 import datetime
-from flask_login import LoginManager, login_user, logout_user, login_required, current_user
-from models import db, User
+import logging
 import os
-os.environ['KMP_DUPLICATE_LIB_OK']='True'
-os.environ['MEDIAPIPE_DISABLE_GPU']='1'  # Force MediaPipe to use CPU only
+import time
+import traceback
+import uuid
+import warnings
+import zipfile
 
-import torch
-import torchvision
-from torchvision import transforms
-from torch.utils.data import DataLoader
-from torch.utils.data.dataset import Dataset
-import numpy as np
+os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
+os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"
+
 import cv2
 import mediapipe as mp
-from torch.autograd import Variable
-import time
-import uuid
-import sys
-import traceback
+import numpy as np
+import torch
+import torch.nn.functional as F
+from flask import Flask, jsonify, request, send_from_directory
+from flask_login import (
+    LoginManager,
+    current_user,
+    login_required,
+    login_user,
+    logout_user,
+)
+from huggingface_hub import hf_hub_download
+from models import User, db
+from torch import nn
+from torch.utils.data.dataset import Dataset
+from torchvision import models, transforms
+from werkzeug.exceptions import HTTPException
+from werkzeug.utils import secure_filename
+
+warnings.filterwarnings("ignore")
 
 # Initialize MediaPipe Face Mesh for CPU
 mp_face_mesh = mp.solutions.face_mesh
-mp_drawing = mp.solutions.drawing_utils
 face_mesh = mp_face_mesh.FaceMesh(
     static_image_mode=True,
     max_num_faces=1,
     min_detection_confidence=0.5,
     min_tracking_confidence=0.5,
-    refine_landmarks=False  # Disable GPU-dependent feature
+    refine_landmarks=False,
 )
-import logging
-import zipfile
-from torch import nn
-import torch.nn.functional as F
-from torchvision import models
-from skimage import img_as_ubyte
-import warnings
-warnings.filterwarnings("ignore")
-import matplotlib.pyplot as plt
-import matplotlib
-matplotlib.use('Agg')
-from matplotlib.colors import LinearSegmentedColormap
-from huggingface_hub import hf_hub_download
-from fastapi import FastAPI, UploadFile, File
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Get the absolute path for the upload folder
-UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Uploaded_Files')
-FRAMES_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'frames')
-GRAPHS_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'graphs')
-DATASET_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Admin', 'datasets')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+INSTANCE_DIR = os.path.join(BASE_DIR, "instance")
+RUNTIME_DIR = os.path.join(INSTANCE_DIR, "runtime")
+UPLOAD_FOLDER = os.path.join(RUNTIME_DIR, "uploads")
+FRAMES_FOLDER = os.path.join(RUNTIME_DIR, "frames")
+DATASET_FOLDER = os.path.join(BASE_DIR, "Admin", "datasets")
+ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov"}
 
-# Create the folders if they don't exist
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(FRAMES_FOLDER, exist_ok=True)
-os.makedirs(GRAPHS_FOLDER, exist_ok=True)
-os.makedirs(DATASET_FOLDER, exist_ok=True)
+for directory in [INSTANCE_DIR, RUNTIME_DIR, UPLOAD_FOLDER, FRAMES_FOLDER, DATASET_FOLDER]:
+    os.makedirs(directory, exist_ok=True)
 
-# Ensure folders have proper permissions
-os.chmod(FRAMES_FOLDER, 0o755)
-os.chmod(GRAPHS_FOLDER, 0o755)
-os.chmod(DATASET_FOLDER, 0o755)
-
-video_path = ""
-detectOutput = []
-
-app = Flask("__main__", template_folder="templates", static_folder="static")
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max file size
-import os
-app.config['SECRET_KEY'] = os.environ.get(
-    'SECRET_KEY', 
-    'dev-only-insecure-key-change-in-production'
+app = Flask(__name__, static_folder=None)
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
+app.config["SECRET_KEY"] = os.environ.get(
+    "SECRET_KEY",
+    "dev-only-insecure-key-change-in-production",
 )
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///users.db'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
+    "DATABASE_URL",
+    "sqlite:///users.db",
+)
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["FRONTEND_ORIGIN"] = os.environ.get("FRONTEND_ORIGIN")
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = os.environ.get("SESSION_COOKIE_SAMESITE", "Lax")
+app.config["SESSION_COOKIE_SECURE"] = (
+    os.environ.get("SESSION_COOKIE_SECURE", "false").lower() == "true"
+)
 
 # Initialize Flask-Login
 login_manager = LoginManager()
 login_manager.init_app(app)
-login_manager.login_view = 'login'
 
 # Initialize SQLAlchemy
 db.init_app(app)
 
+
+def json_success(payload=None, status=200):
+    response = {"success": True}
+    if payload:
+        response.update(payload)
+    return jsonify(response), status
+
+
+def json_error(message, status=400, **extra):
+    response = {"success": False, "error": message}
+    if extra:
+        response.update(extra)
+    return jsonify(response), status
+
+
+def serialize_user(user):
+    return {
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+    }
+
+
+def get_frontend_origin():
+    origin = app.config.get("FRONTEND_ORIGIN")
+    return origin.rstrip("/") if origin else None
+
+
+def normalize_extension(filename):
+    _, extension = os.path.splitext(filename or "")
+    return extension.lower()
+
+
+def is_allowed_video(filename):
+    return normalize_extension(filename) in ALLOWED_VIDEO_EXTENSIONS
+
+
+def is_request_from_allowed_origin():
+    origin = request.headers.get("Origin")
+    if not origin:
+        return False
+
+    configured_origin = get_frontend_origin()
+    if configured_origin:
+        return origin.rstrip("/") == configured_origin
+
+    return True
+
+
 @login_manager.user_loader
 def load_user(user_id):
-    return User.query.get(int(user_id))
+    return db.session.get(User, int(user_id))
 
-# Create all database tables
+
+@login_manager.unauthorized_handler
+def unauthorized():
+    return json_error("Authentication required", status=401)
+
+
 with app.app_context():
     db.create_all()
 
-@app.route('/api/signup', methods=['GET', 'POST'])
-@app.route('/signup', methods=['GET', 'POST'])
-def signup():
-    if request.is_json:
-        data = request.get_json()
-        username = data.get('username')
-        email = data.get('email')
-        password = data.get('password')
-        if User.query.filter_by(email=email).first():
-            return jsonify({'success': False, 'error': 'Email already exists'}), 400
-        user = User(username=username, email=email)
-        user.set_password(password)
-        db.session.add(user)
-        db.session.commit()
-        return jsonify({'success': True})
-        
-    if request.method == 'POST':
-        username = request.form.get('username')
-        email = request.form.get('email')
-        password = request.form.get('password')
-        confirm_password = request.form.get('confirm_password')
 
-        if password != confirm_password:
-            return render_template('signup.html', error="Passwords do not match")
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    return None
 
-        user = User.query.filter_by(email=email).first()
-        if user:
-            return render_template('signup.html', error="Email already exists")
 
-        user = User.query.filter_by(username=username).first()
-        if user:
-            return render_template('signup.html', error="Username already exists")
+@app.after_request
+def after_request(response):
+    if is_request_from_allowed_origin():
+        response.headers["Access-Control-Allow-Origin"] = request.headers["Origin"]
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Vary"] = "Origin"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    return response
 
-        new_user = User(username=username, email=email)
-        new_user.set_password(password)
-        db.session.add(new_user)
-        db.session.commit()
 
-        login_user(new_user)
-        return redirect(url_for('homepage'))
+@app.errorhandler(HTTPException)
+def handle_http_exception(error):
+    return json_error(error.description, status=error.code or 500)
 
-    return render_template('signup.html')
 
-@app.route('/api/login', methods=['GET', 'POST'])
-@app.route('/login', methods=['GET', 'POST'])
+@app.errorhandler(Exception)
+def handle_unexpected_exception(error):
+    logger.exception("Unhandled application error")
+    return json_error("Internal server error", status=500)
+
+
+@app.route("/")
+@app.route("/api/health")
+def healthcheck():
+    return json_success(
+        {
+            "service": "DeepSynth API",
+            "ui": "React frontend",
+            "status": "ok",
+        }
+    )
+
+
+@app.route("/api/register", methods=["POST"])
+@app.route("/api/signup", methods=["POST"])
+def register():
+    if not request.is_json:
+        return json_error("Expected application/json request body", status=415)
+
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+
+    if not username or not email or not password:
+        return json_error("Username, email, and password are required", status=400)
+
+    if len(password) < 8:
+        return json_error("Password must be at least 8 characters long", status=400)
+
+    if User.query.filter_by(email=email).first():
+        return json_error("Email already exists", status=409)
+
+    if User.query.filter_by(username=username).first():
+        return json_error("Username already exists", status=409)
+
+    user = User(username=username, email=email)
+    user.set_password(password)
+    db.session.add(user)
+    db.session.commit()
+
+    return json_success(
+        {
+            "message": "Registration successful",
+            "user": serialize_user(user),
+        },
+        status=201,
+    )
+
+
+@app.route("/api/login", methods=["POST"])
 def login():
-    if request.is_json:
-        data = request.get_json()
-        email = data.get('email')
-        password = data.get('password')
-        user = User.query.filter_by(email=email).first()
-        if user and user.check_password(password):
-            login_user(user)
-            return jsonify({'success': True, 'username': user.username})
-        return jsonify({'success': False, 'error': 'Invalid credentials'}), 401
-        
-    if request.method == 'POST':
-        email = request.form.get('email')
-        password = request.form.get('password')
-        user = User.query.filter_by(email=email).first()
+    if not request.is_json:
+        return json_error("Expected application/json request body", status=415)
 
-        if user and user.check_password(password):
-            login_user(user)
-            return redirect(url_for('homepage'))
-        else:
-            return render_template('login.html', error="Invalid email or password")
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
 
-    return render_template('login.html')
+    if not email or not password:
+        return json_error("Email and password are required", status=400)
 
-@app.route('/api/logout')
-@app.route('/logout')
-@login_required
+    user = User.query.filter_by(email=email).first()
+    if not user or not user.check_password(password):
+        return json_error("Invalid credentials", status=401)
+
+    login_user(user)
+    return json_success({"user": serialize_user(user)})
+
+
+@app.route("/api/logout", methods=["POST"])
 def logout():
-    logout_user()
-    return redirect(url_for('homepage'))
+    if current_user.is_authenticated:
+        logout_user()
+    return json_success({"message": "Logged out"})
 
-def generate_confidence_graph(confidence):
+
+@app.route("/api/me", methods=["GET"])
+def get_current_user():
+    if not current_user.is_authenticated:
+        return json_success({"authenticated": False, "user": None})
+
+    return json_success(
+        {
+            "authenticated": True,
+            "user": serialize_user(current_user),
+        }
+    )
+
+
+def ensure_admin():
+    if not current_user.is_authenticated:
+        return json_error("Authentication required", status=401)
+    if not getattr(current_user, "is_admin", False):
+        return json_error("Admin access required", status=403)
+    return None
+
+
+def get_datasets():
+    datasets = []
+    for item in os.listdir(DATASET_FOLDER):
+        if item.endswith(".zip"):
+            path = os.path.join(DATASET_FOLDER, item)
+            stats = os.stat(path)
+            datasets.append(
+                {
+                    "name": item,
+                    "size": stats.st_size,
+                    "upload_date": datetime.datetime.fromtimestamp(stats.st_mtime).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
+                }
+            )
+    return datasets
+
+
+@app.route("/api/admin/datasets", methods=["GET"])
+@login_required
+def admin_datasets():
+    admin_error = ensure_admin()
+    if admin_error:
+        return admin_error
+    return json_success({"datasets": get_datasets()})
+
+
+@app.route("/api/admin/upload", methods=["POST"])
+@login_required
+def admin_upload():
+    admin_error = ensure_admin()
+    if admin_error:
+        return admin_error
+
+    if "dataset" not in request.files:
+        return json_error("No file uploaded", status=400)
+
+    dataset = request.files["dataset"]
+    if not dataset.filename:
+        return json_error("No file selected", status=400)
+
+    if not dataset.filename.lower().endswith(".zip"):
+        return json_error("Invalid file format. Please upload ZIP files only.", status=400)
+
+    filename = secure_filename(dataset.filename)
+    filepath = os.path.join(DATASET_FOLDER, filename)
+
     try:
-        plt.figure(figsize=(10, 10))
-        plt.style.use('dark_background')
-        
-        real_cmap = LinearSegmentedColormap.from_list('custom_real', ['#2ecc71', '#27ae60'])
-        fake_cmap = LinearSegmentedColormap.from_list('custom_fake', ['#e74c3c', '#c0392b'])
-        
-        colors = [real_cmap(0.6), fake_cmap(0.6)]
-        
-        sizes = [confidence, 100 - confidence]
-        labels = ['Real', 'Fake']
-        explode = (0.05, 0)
-        
-        wedges, texts, autotexts = plt.pie(sizes, 
-                                          explode=explode, 
-                                          labels=labels, 
-                                          colors=colors,
-                                          autopct='%1.1f%%', 
-                                          shadow=True, 
-                                          startangle=90,
-                                          textprops={'fontsize': 14, 'color': 'white'},
-                                          wedgeprops={'edgecolor': '#2c3e50', 'linewidth': 2})
-        
-        plt.setp(autotexts, size=12, weight="bold")
-        plt.setp(texts, size=14, weight="bold")
-        
-        plt.title('Confidence Score', 
-                 pad=20, 
-                 fontsize=16, 
-                 fontweight='bold', 
-                 color='white')
-        
-        plt.axis('equal')
-        plt.grid(True, alpha=0.1, linestyle='--')
-        
-        unique_id = str(uuid.uuid4()).split('-')[0]
-        graph_filename = f'confidence_{unique_id}.png'
-        graph_path = os.path.join(GRAPHS_FOLDER, graph_filename)
-        plt.savefig(graph_path, 
-                   bbox_inches='tight', 
-                   dpi=300, 
-                   transparent=True,
-                   facecolor='#1a1a1a')
-        plt.close()
-        
-        logger.info(f"Generated confidence graph: {graph_filename}")
-        return f'graphs/{graph_filename}'
-    except Exception as e:
-        logger.error(f"Error generating confidence graph: {str(e)}")
-        traceback.print_exc()
-        return None
+        dataset.save(filepath)
+        with zipfile.ZipFile(filepath, "r") as zip_ref:
+            zip_ref.testzip()
+
+        logger.info("Dataset uploaded successfully: %s", filename)
+        return json_success(
+            {
+                "message": "Dataset uploaded successfully",
+                "dataset": {
+                    "name": filename,
+                    "size": os.path.getsize(filepath),
+                    "upload_date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                },
+            }
+        )
+    except Exception as error:
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        logger.error("Error uploading dataset: %s", error)
+        return json_error(f"Error uploading dataset: {error}", status=400)
+
+
+@app.route("/api/assets/frames/<path:filename>", methods=["GET"])
+@login_required
+def serve_frame(filename):
+    return send_from_directory(FRAMES_FOLDER, filename)
 
 
 class Model(nn.Module):
-    def __init__(self, num_classes, latent_dim=2048, lstm_layers=1, hidden_dim=2048, bidirectional=False):
-        super(Model, self).__init__()
-        model = models.resnext50_32x4d(pretrained=True)
-        self.model = nn.Sequential(*list(model.children())[:-2])
+    def __init__(
+        self,
+        num_classes,
+        latent_dim=2048,
+        lstm_layers=1,
+        hidden_dim=2048,
+        bidirectional=False,
+    ):
+        super().__init__()
+        backbone = models.resnext50_32x4d(pretrained=True)
+        self.model = nn.Sequential(*list(backbone.children())[:-2])
         self.lstm = nn.LSTM(latent_dim, hidden_dim, lstm_layers, bidirectional)
-        self.relu = nn.LeakyReLU()
         self.dp = nn.Dropout(0.4)
         self.linear1 = nn.Linear(2048, num_classes)
         self.avgpool = nn.AdaptiveAvgPool2d(1)
 
     def forward(self, x):
-        batch_size, seq_length, c, h, w = x.shape
-        x = x.view(batch_size*seq_length, c, h, w)
+        batch_size, seq_length, channels, height, width = x.shape
+        x = x.view(batch_size * seq_length, channels, height, width)
         fmap = self.model(x)
         x = self.avgpool(fmap)
         x = x.view(batch_size, seq_length, 2048)
-        x_lstm,_ = self.lstm(x, None)
-        return fmap, self.dp(self.linear1(x_lstm[:,-1,:]))
+        x_lstm, _ = self.lstm(x, None)
+        return fmap, self.dp(self.linear1(x_lstm[:, -1, :]))
+
 
 def extract_frames(video_path, num_frames=8):
     frames = []
     frame_paths = []
-    unique_id = str(uuid.uuid4()).split('-')[0]
-    
+    unique_id = str(uuid.uuid4()).split("-")[0]
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        raise Exception("Error opening video file")
-        
+        raise ValueError("Error opening video file")
+
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total_frames == 0:
-        raise Exception("Video file appears to be empty")
-        
-    interval = total_frames // num_frames
-    
+    if total_frames <= 0:
+        raise ValueError("Video file appears to be empty")
+
+    interval = max(total_frames // max(num_frames, 1), 1)
+
     count = 0
     frame_count = 0
-    
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-            
+
         if count % interval == 0 and frame_count < num_frames:
-            # Convert BGR to RGB
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            # Process the frame with MediaPipe Face Mesh
             results = face_mesh.process(rgb_frame)
-            
+
             if not results.multi_face_landmarks:
+                count += 1
                 continue
-                
+
             try:
                 face_landmarks = results.multi_face_landmarks[0]
-                
-                # Get face bounding box from landmarks
-                h, w, _ = frame.shape
+
+                height, width, _ = frame.shape
                 x_coordinates = [landmark.x for landmark in face_landmarks.landmark]
                 y_coordinates = [landmark.y for landmark in face_landmarks.landmark]
-                
+
                 x_min, x_max = min(x_coordinates), max(x_coordinates)
                 y_min, y_max = min(y_coordinates), max(y_coordinates)
-                
-                # Convert normalized coordinates to pixel coordinates
-                x = int(x_min * w)
-                y = int(y_min * h)
-                face_width = int((x_max - x_min) * w)
-                face_height = int((y_max - y_min) * h)
-                
-                # Add padding (20%)
+
+                x = int(x_min * width)
+                y = int(y_min * height)
+                face_width = int((x_max - x_min) * width)
+                face_height = int((y_max - y_min) * height)
+
                 padding_x = int(face_width * 0.2)
                 padding_y = int(face_height * 0.2)
-                
-                # Calculate coordinates with padding and boundary checks
+
                 left = max(0, x - padding_x)
                 top = max(0, y - padding_y)
-                right = min(w, x + face_width + padding_x)
-                bottom = min(h, y + face_height + padding_y)
-                
+                right = min(width, x + face_width + padding_x)
+                bottom = min(height, y + face_height + padding_y)
+
                 face_frame = frame[top:bottom, left:right, :]
-                frame_path = os.path.join(FRAMES_FOLDER, f'frame_{unique_id}_{frame_count}.jpg')
+                frame_filename = f"frame_{unique_id}_{frame_count}.jpg"
+                frame_path = os.path.join(FRAMES_FOLDER, frame_filename)
                 cv2.imwrite(frame_path, face_frame)
-                frame_paths.append(os.path.basename(frame_path))
+                frame_paths.append(frame_filename)
                 frames.append(face_frame)
                 frame_count += 1
-                logger.info(f"Extracted frame {frame_count}: {os.path.basename(frame_path)}")
-            except Exception as e:
-                logger.error(f"Error processing frame {frame_count}: {str(e)}")
-                continue
-                
+                logger.info("Extracted frame %s: %s", frame_count, frame_filename)
+            except Exception as error:
+                logger.error("Error processing frame %s: %s", frame_count, error)
+
         count += 1
         if frame_count >= num_frames:
             break
-            
+
     cap.release()
-    
+
     if len(frames) == 0:
-        raise Exception("No faces detected in the video")
-        
+        raise ValueError("No faces detected in the video")
+
     return frames, frame_paths
 
-def predict(model, img, path='./'):
-    try:
-        with torch.no_grad():
-            fmap, logits = model(img.to())
-            params = list(model.parameters())
-            weight_softmax = model.linear1.weight.detach().cpu().numpy()
-            logits = F.softmax(logits, dim=1)
-            _, prediction = torch.max(logits, 1)
-            confidence = logits[:, int(prediction.item())].item() * 100
-            
-            try:
-                frame_scores = logits.detach().cpu().numpy().flatten().tolist()
-                if len(frame_scores) < 20:
-                    frame_scores = [0.5]*20
-            except:
-                frame_scores = [0.5]*20
-                
-            logger.info(f'Prediction confidence: {confidence}%')
-            return [int(prediction.item()), confidence, frame_scores]
-    except Exception as e:
-        logger.error(f"Error during prediction: {str(e)}")
-        traceback.print_exc()
-        raise
+
+def predict(model, img):
+    with torch.no_grad():
+        _, logits = model(img)
+        probabilities = F.softmax(logits, dim=1)
+        _, prediction = torch.max(probabilities, 1)
+        confidence = probabilities[:, int(prediction.item())].item() * 100
+        logger.info("Prediction confidence: %.2f%%", confidence)
+        return int(prediction.item()), float(confidence)
+
 
 class validation_dataset(Dataset):
     def __init__(self, video_names, sequence_length=60, transform=None):
@@ -365,246 +475,145 @@ class validation_dataset(Dataset):
     def __getitem__(self, idx):
         video_path = self.video_names[idx]
         frames = []
-        a = int(100 / self.count)
-        first_frame = np.random.randint(0,a)
+        step = max(int(100 / self.count), 1)
+        first_frame = np.random.randint(0, step)
+
         for i, frame in enumerate(self.frame_extract(video_path)):
-            # Convert BGR to RGB for MediaPipe Face Mesh
+            if i < first_frame:
+                continue
+
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = face_mesh.process(rgb_frame)
-            
+
             try:
                 if results.multi_face_landmarks:
                     face_landmarks = results.multi_face_landmarks[0]
-                    
-                    # Get face bounding box from landmarks
-                    h, w, _ = frame.shape
+
+                    height, width, _ = frame.shape
                     x_coordinates = [landmark.x for landmark in face_landmarks.landmark]
                     y_coordinates = [landmark.y for landmark in face_landmarks.landmark]
-                    
+
                     x_min, x_max = min(x_coordinates), max(x_coordinates)
                     y_min, y_max = min(y_coordinates), max(y_coordinates)
-                    
-                    # Convert normalized coordinates to pixel coordinates
-                    x = int(x_min * w)
-                    y = int(y_min * h)
-                    face_width = int((x_max - x_min) * w)
-                    face_height = int((y_max - y_min) * h)
-                    
-                    # Add padding (20%)
+
+                    x = int(x_min * width)
+                    y = int(y_min * height)
+                    face_width = int((x_max - x_min) * width)
+                    face_height = int((y_max - y_min) * height)
+
                     padding_x = int(face_width * 0.2)
                     padding_y = int(face_height * 0.2)
-                    
-                    # Calculate coordinates with padding and boundary checks
+
                     left = max(0, x - padding_x)
                     top = max(0, y - padding_y)
-                    right = min(w, x + face_width + padding_x)
-                    bottom = min(h, y + face_height + padding_y)
-                    
+                    right = min(width, x + face_width + padding_x)
+                    bottom = min(height, y + face_height + padding_y)
+
                     frame = frame[top:bottom, left:right, :]
-            except:
+            except Exception:
                 pass
+
             frames.append(self.transform(frame))
-            if(len(frames) == self.count):
+            if len(frames) == self.count:
                 break
-        frames = torch.stack(frames)
-        frames = frames[:self.count]
+
+        if not frames:
+            raise ValueError("Unable to extract valid frames for inference")
+
+        frames = torch.stack(frames)[: self.count]
         return frames.unsqueeze(0)
 
     def frame_extract(self, path):
-        vidObj = cv2.VideoCapture(path)
-        success = 1
+        video = cv2.VideoCapture(path)
+        success = True
         while success:
-            success, image = vidObj.read()
+            success, image = video.read()
             if success:
                 yield image
 
-def detectFakeVideo(videoPath):
+
+def detect_fake_video(video_path):
     start_time = time.time()
-    
-    try:
-        im_size = 112
-        mean = [0.485, 0.456, 0.406]
-        std = [0.229, 0.224, 0.225]
 
-        train_transforms = transforms.Compose([
+    im_size = 112
+    mean = [0.485, 0.456, 0.406]
+    std = [0.229, 0.224, 0.225]
+
+    train_transforms = transforms.Compose(
+        [
             transforms.ToPILImage(),
-            transforms.Resize((im_size,im_size)),
+            transforms.Resize((im_size, im_size)),
             transforms.ToTensor(),
-            transforms.Normalize(mean,std)
-        ])
-        
+            transforms.Normalize(mean, std),
+        ]
+    )
 
-        ## old one (file model)
-        # path_to_videos = [videoPath]
-        # video_dataset = validation_dataset(path_to_videos, sequence_length=20, transform=train_transforms)
-        # model = Model(2)
-        # path_to_model = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'model/df_model.pt')
-        
-        path_to_videos = [videoPath]
-        video_dataset = validation_dataset(path_to_videos, sequence_length=20, transform=train_transforms)
-        model = Model(2)
+    video_dataset = validation_dataset([video_path], sequence_length=20, transform=train_transforms)
+    model = Model(2)
 
-        # Download and load model from Hugging Face Hub
-        model_path = hf_hub_download(repo_id="imtiyaz123/DF_Model", filename="df_model.pt")
-        model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
-        model.eval()
-        
-        frames_tensor = video_dataset[0]
-        print("INPUT TENSOR SHAPE:", frames_tensor.shape)
-        prediction = predict(model, frames_tensor, './')
-        
-        processing_time = time.time() - start_time
-        logger.info(f"Video processing completed in {processing_time:.2f} seconds")
-        
-        return prediction, processing_time
-    except Exception as e:
-        logger.error(f"Error in detectFakeVideo: {str(e)}")
-        traceback.print_exc()
-        raise
+    model_path = hf_hub_download(repo_id="imtiyaz123/DF_Model", filename="df_model.pt")
+    model.load_state_dict(torch.load(model_path, map_location=torch.device("cpu")))
+    model.eval()
 
-def get_datasets():
-    datasets = []
-    for item in os.listdir(DATASET_FOLDER):
-        if item.endswith('.zip'):
-            path = os.path.join(DATASET_FOLDER, item)
-            stats = os.stat(path)
-            datasets.append({
-                'name': item,
-                'size': stats.st_size,
-                'upload_date': datetime.datetime.fromtimestamp(stats.st_mtime).strftime('%Y-%m-%d %H:%M:%S')
-            })
-    return datasets
+    frames_tensor = video_dataset[0]
+    prediction, confidence = predict(model, frames_tensor)
 
-@app.route('/static/<path:filename>')
-def serve_static(filename):
-    return send_from_directory('static', filename)
+    processing_time = time.time() - start_time
+    logger.info("Video processing completed in %.2f seconds", processing_time)
 
-@app.after_request
-def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', 'http://localhost:5173')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
-    return response
+    return prediction, confidence, processing_time
 
-@app.route('/')
-def homepage():
-    return render_template('home.html')
 
-@app.route('/admin')
-@login_required
-def admin():
-    if not getattr(current_user, 'is_admin', False):
-        return redirect(url_for('homepage'))
-    datasets = get_datasets()
-    return render_template('admin.html', datasets=datasets)
-
-@app.route('/admin/upload', methods=['POST'])
-@login_required
-def admin_upload():
-    if 'dataset' not in request.files:
-        return jsonify({'success': False, 'error': 'No file uploaded'})
-        
-    dataset = request.files['dataset']
-    if dataset.filename == '':
-        return jsonify({'success': False, 'error': 'No file selected'})
-        
-    if not dataset.filename.lower().endswith('.zip'):
-        return jsonify({'success': False, 'error': 'Invalid file format. Please upload ZIP files only.'})
-        
-    try:
-        filename = secure_filename(dataset.filename)
-        filepath = os.path.join(DATASET_FOLDER, filename)
-        dataset.save(filepath)
-        
-        with zipfile.ZipFile(filepath, 'r') as zip_ref:
-            zip_ref.testzip()
-            
-        logger.info(f"Dataset uploaded successfully: {filename}")
-        return jsonify({
-            'success': True,
-            'message': 'Dataset uploaded successfully',
-            'dataset': {
-                'name': filename,
-                'size': os.path.getsize(filepath),
-                'upload_date': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            }
-        })
-    except Exception as e:
-        if os.path.exists(filepath):
-            os.remove(filepath)
-        logger.error(f"Error uploading dataset: {str(e)}")
-        return jsonify({'success': False, 'error': f'Error uploading dataset: {str(e)}'})
-
-@app.route('/api/detect', methods=['GET', 'POST'])
-@app.route('/detect', methods=['GET', 'POST'])
+@app.route("/api/detect", methods=["POST"])
 @login_required
 def detect():
-    if 'video' not in request.files:
-        return jsonify({'success': False, 'error': 'No video file uploaded'})
-        
-    video = request.files['video']
-    if video.filename == '':
-        return jsonify({'success': False, 'error': 'No video file selected'})
-        
-    if not video.filename.lower().endswith(('.mp4', '.avi', '.mov', '.png', '.jpeg', '.jpg')):
-        return jsonify({'success': False, 'error': 'Invalid file format.'})
-        
-    video_filename = secure_filename(video.filename)
-    video_path = os.path.join(app.config['UPLOAD_FOLDER'], video_filename)
+    if "video" not in request.files:
+        return json_error("No video file uploaded", status=400)
+
+    video = request.files["video"]
+    if not video.filename:
+        return json_error("No video file selected", status=400)
+
+    if not is_allowed_video(video.filename):
+        return json_error(
+            "Invalid file format. Supported formats: MP4, AVI, MOV.",
+            status=400,
+        )
+
+    safe_name = secure_filename(video.filename) or "upload.mp4"
+    video_filename = f"{uuid.uuid4().hex}_{safe_name}"
+    video_path = os.path.join(app.config["UPLOAD_FOLDER"], video_filename)
     video.save(video_path)
-    
+
     try:
-        logger.info(f"Processing video: {video_filename}")
-        
-        frames, frame_paths = extract_frames(video_path)
-        
-        if not frames:
-            raise Exception("No frames could be extracted from the video")
-        
-        prediction, processing_time = detectFakeVideo(video_path)
-        
-        if prediction[0] == 0:
-            output = "FAKE"
-        else:
-            output = "REAL"
-            
-        confidence = prediction[1]
-        frame_scores = prediction[2] if len(prediction) > 2 else [0.5]*20
-        
-        logger.info(f"Video prediction: {output} with confidence {confidence}%")
-        
-        confidence_image = generate_confidence_graph(confidence)
-        
-        data = {
-            'success': True,
-            'output': output, 
-            'confidence': confidence,
-            'frames': frame_paths,
-            'frame_scores': frame_scores,
-            'processing_time': round(processing_time, 2),
-            'confidence_image': confidence_image
-        }
-        
-        logger.info(f"Sending response data: {data}")
-        os.remove(video_path)
-        return jsonify(data)
-        
-    except Exception as e:
+        if os.path.getsize(video_path) == 0:
+            return json_error("Uploaded video file is empty", status=400)
+
+        logger.info("Processing video: %s", video_filename)
+        _, frame_paths = extract_frames(video_path)
+        prediction_index, confidence, processing_time = detect_fake_video(video_path)
+
+        prediction = "fake" if prediction_index == 0 else "real"
+        logger.info("Video prediction: %s with confidence %.2f%%", prediction, confidence)
+
+        return json_success(
+            {
+                "prediction": prediction,
+                "confidence": round(confidence, 2),
+                "frames": frame_paths,
+                "frame_scores": [],
+                "processing_time": round(processing_time, 2),
+            }
+        )
+    except Exception as error:
+        logger.error("Error processing video: %s", error)
+        traceback.print_exc()
+        return json_error(f"Error processing video: {error}", status=400)
+    finally:
         if os.path.exists(video_path):
             os.remove(video_path)
-        error_msg = str(e)
-        logger.error(f"Error processing video: {error_msg}")
-        traceback.print_exc()
-        return jsonify({'success': False, 'error': f'Error processing video: {error_msg}'})
 
-@app.route('/privacy')
-def privacy():
-    return render_template('privacy.html')
 
-@app.route('/terms')
-def terms():
-    return render_template('terms.html')
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=True)
