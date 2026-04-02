@@ -7,9 +7,14 @@ import uuid
 import warnings
 import zipfile
 
-os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
-os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"
-
+from backend.config.settings import (
+    ALLOWED_VIDEO_EXTENSIONS,
+    DATASET_FOLDER,
+    FRAMES_FOLDER,
+    Settings,
+    UPLOAD_FOLDER,
+    ensure_runtime_directories,
+)
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -47,35 +52,9 @@ face_mesh = mp_face_mesh.FaceMesh(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-INSTANCE_DIR = os.path.join(BASE_DIR, "instance")
-RUNTIME_DIR = os.path.join(INSTANCE_DIR, "runtime")
-UPLOAD_FOLDER = os.path.join(RUNTIME_DIR, "uploads")
-FRAMES_FOLDER = os.path.join(RUNTIME_DIR, "frames")
-DATASET_FOLDER = os.path.join(BASE_DIR, "Admin", "datasets")
-ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov"}
-
-for directory in [INSTANCE_DIR, RUNTIME_DIR, UPLOAD_FOLDER, FRAMES_FOLDER, DATASET_FOLDER]:
-    os.makedirs(directory, exist_ok=True)
-
 app = Flask(__name__, static_folder=None)
-app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
-app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
-app.config["SECRET_KEY"] = os.environ.get(
-    "SECRET_KEY",
-    "dev-only-insecure-key-change-in-production",
-)
-app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
-    "DATABASE_URL",
-    "sqlite:///users.db",
-)
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["FRONTEND_ORIGIN"] = os.environ.get("FRONTEND_ORIGIN")
-app.config["SESSION_COOKIE_HTTPONLY"] = True
-app.config["SESSION_COOKIE_SAMESITE"] = os.environ.get("SESSION_COOKIE_SAMESITE", "Lax")
-app.config["SESSION_COOKIE_SECURE"] = (
-    os.environ.get("SESSION_COOKIE_SECURE", "false").lower() == "true"
-)
+app.config.from_object(Settings)
+ensure_runtime_directories()
 
 # Initialize Flask-Login
 login_manager = LoginManager()
