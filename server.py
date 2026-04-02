@@ -8,19 +8,20 @@ import warnings
 import zipfile
 
 from backend.config.settings import (
-    ALLOWED_VIDEO_EXTENSIONS,
     DATASET_FOLDER,
     FRAMES_FOLDER,
     Settings,
     UPLOAD_FOLDER,
     ensure_runtime_directories,
 )
+from backend.utils.file_utils import is_allowed_video
+from backend.utils.response import json_error, json_success
 import cv2
 import mediapipe as mp
 import numpy as np
 import torch
 import torch.nn.functional as F
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, request, send_from_directory
 from flask_login import (
     LoginManager,
     current_user,
@@ -62,22 +63,6 @@ login_manager.init_app(app)
 
 # Initialize SQLAlchemy
 db.init_app(app)
-
-
-def json_success(payload=None, status=200):
-    response = {"success": True}
-    if payload:
-        response.update(payload)
-    return jsonify(response), status
-
-
-def json_error(message, status=400, **extra):
-    response = {"success": False, "error": message}
-    if extra:
-        response.update(extra)
-    return jsonify(response), status
-
-
 def serialize_user(user):
     return {
         "id": user.id,
@@ -89,17 +74,6 @@ def serialize_user(user):
 def get_frontend_origin():
     origin = app.config.get("FRONTEND_ORIGIN")
     return origin.rstrip("/") if origin else None
-
-
-def normalize_extension(filename):
-    _, extension = os.path.splitext(filename or "")
-    return extension.lower()
-
-
-def is_allowed_video(filename):
-    return normalize_extension(filename) in ALLOWED_VIDEO_EXTENSIONS
-
-
 def is_request_from_allowed_origin():
     origin = request.headers.get("Origin")
     if not origin:
