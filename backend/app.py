@@ -8,10 +8,10 @@ from werkzeug.exceptions import HTTPException
 
 from backend.config.settings import Settings, ensure_runtime_directories
 from backend.models.db_models import db
-from backend.routes.admin import register_admin_routes
-from backend.routes.auth import configure_login_manager, register_auth_routes
-from backend.routes.detect import register_detect_routes
-from backend.routes.health import register_health_routes
+from backend.routes.admin import admin_bp
+from backend.routes.auth import auth_bp, configure_login_manager
+from backend.routes.detect import detect_bp
+from backend.routes.health import health_bp
 from backend.utils.response import json_error
 
 warnings.filterwarnings("ignore")
@@ -34,10 +34,10 @@ def create_app():
     with app.app_context():
         db.create_all()
 
-    register_health_routes(app)
-    register_auth_routes(app)
-    register_admin_routes(app)
-    register_detect_routes(app)
+    app.register_blueprint(health_bp)
+    app.register_blueprint(auth_bp)
+    app.register_blueprint(admin_bp)
+    app.register_blueprint(detect_bp)
 
     def get_frontend_origin():
         origin = app.config.get("FRONTEND_ORIGIN")
